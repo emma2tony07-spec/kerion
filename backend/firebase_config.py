@@ -3,50 +3,52 @@ import json
 import firebase_admin
 from firebase_admin import credentials, db
 
-# Initialize Firebase
+_app_initialized = False
+
 def init_firebase():
-    try:
-        # Check if already initialized
-        firebase_admin.get_app()
-    except ValueError:
-        # Not initialized yet
-        cred = None
-        
-        # For local development: use the JSON file
-        if os.path.exists("firebase-credentials.json"):
-            cred = credentials.Certificate("firebase-credentials.json")
-        else:
-            # For Render: use environment variable
-            firebase_creds = os.environ.get("FIREBASE_CREDENTIALS")
-            if not firebase_creds:
-                raise Exception(
-                    "FIREBASE_CREDENTIALS environment variable not set. "
-                    "On Render, add it in Environment Variables. "
-                    "Locally, place firebase-credentials.json in the project root."
-                )
-            
-            # Parse the JSON from environment variable
-            cred_dict = json.loads(firebase_creds)
-            cred = credentials.Certificate(cred_dict)
-        
-        # Initialize the app with Realtime Database URL
-        database_url = os.environ.get(
-            "FIREBASE_DATABASE_URL",
-            cred_dict.get("databaseURL", None) if 'cred_dict' in locals() else None
-        )
-        
-        if not database_url:
-            raise Exception("FIREBASE_DATABASE_URL not set. Add it to Render environment variables.")
-        
-        firebase_admin.initialize_app(cred, {
-            'databaseURL': database_url
-        })
-        print("Firebase initialized successfully.")
+    global _app_initialized
+    if _app_initialized:
+        return
 
-# Run on import
-init_firebase()
+    cred = None
+    cred_dict = None
 
-# Helper to get DB reference
+    # For local development: use the JSON file
+    if os.path.exists("firebase-credentials.json"):
+        with open("firebase-credentials.json") as f:
+            cred_dict = json.load(f)
+        cred = credentials.Certificate("firebase-credentials.json")
+    else:
+        # For Render: use environment variable
+        firebase_creds = os.environ.get("FIREBASE_CREDENTIALS")
+        if not firebase_creds:
+            raise Exception(
+                "FIREBASE_CREDENTIALS environment variable not set. "
+                "On Render, add it in Environment Variables. "
+                "Locally, place firebase-credentials.json in the project root."
+            )
+        cred_dict = json.loads(firebase_creds)
+        cred = credentials.Certificate(cred_dict)
+
+    # Get database URL
+    database_url = os.environ.get("FIREBASE_DATABASE_URL")
+    if not database_url and cred_dict:
+        database_url = cred_dict.get("databaseURL", cred_dict.get("database_url"))
+
+    if not database_url:
+        raise Exception("FIREBASE_DATABASE_URL not set. Add it to Render environment variables.")
+
+    firebase_admin.initialize_app(cred, {
+        'databaseURL': database_url
+    })
+    _app_initialized = True
+    print("Firebase initialized successfully.")
+
 def get_db_ref(path=""):
     """Get a reference to the Firebase Realtime Database at the given path."""
+    if not _app_initialized:
+        init_firebase()
     return db.reference(path)
+
+# Initialize on import
+init_firebase()
