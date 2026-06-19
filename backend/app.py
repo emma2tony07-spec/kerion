@@ -1,157 +1,231 @@
 import os
-import sys
+import json
 import traceback
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
+
 def create_app():
-    """Create and configure the Flask application."""
     app = Flask(__name__)
-    
     CORS(app, resources={r"/api/*": {"origins": "*"}, r"/debug/*": {"origins": "*"}})
-    
+
+    # ═══════════════════════════════
+    # HEALTH
+    # ═══════════════════════════════
     @app.route('/')
     def home():
         return jsonify({
             "status": "ok",
             "app": "Kerion Wallet API",
-            "version": "1.0.2"
+            "version": "1.0.3"
         })
-    
+
     @app.route('/health')
     def health():
         return jsonify({"status": "healthy"}), 200
-    
-    # ═══════════ DEBUG: Check individual env vars ═══════════
-    @app.route('/debug/env', methods=['GET'])
-    def debug_env():
-        vars_to_check = [
-            'FIREBASE_TYPE',
-            'FIREBASE_PROJECT_ID',
-            'FIREBASE_PRIVATE_KEY_ID',
-            'FIREBASE_PRIVATE_KEY',
-            'FIREBASE_CLIENT_EMAIL',
-            'FIREBASE_CLIENT_ID',
-            'FIREBASE_TOKEN_URI',
-            'FIREBASE_DATABASE_URL',
-            'FIREBASE_API_KEY',
-        ]
-        result = {}
-        for var in vars_to_check:
-            val = os.environ.get(var)
-            if not val:
-                result[var] = "NOT SET"
-            elif var == 'FIREBASE_PRIVATE_KEY':
-                # Show start and end to verify format without exposing full key
-                result[var] = f"SET (starts: {val[:25]}... ends: ...{val[-25:]})"
-            else:
-                result[var] = f"SET ({val[:40]}{'...' if len(val) > 40 else ''})"
-        return jsonify({"success": True, "environment": result})
-    
+
+    # ═══════════════════════════════
+    # DEBUG
+    # ═══════════════════════════════
+    @app.route('/debug/status', methods=['GET'])
+    def debug_status():
+        """Quick overview of what's available."""
+        secret_path = "/etc/secrets/firebase-credentials.json"
+        local_path = "firebase-credentials.json"
+
+        return jsonify({
+            "secret_file_exists": os.path.exists(secret_path),
+            "local_file_exists": os.path.exists(local_path),
+            "env_vars": {
+                "FIREBASE_DATABASE_URL": "SET" if os.environ.get("FIREBASE_DATABASE_URL") else "NOT SET",
+                "FIREBASE_API_KEY": "SET" if os.environ.get("FIREBASE_API_KEY") else "NOT SET",
+                "FIREBASE_CREDENTIALS": "SET" if os.environ.get("FIREBASE_CREDENTIALS") else "NOT SET",
+                "FIREBASE_PRIVATE_KEY": "SET" if os.environ.get("FIREBASE_PRIVATE_KEY") else "NOT SET",
+                "FIREBASE_PROJECT_ID": "SET" if os.environ.get("FIREBASE_PROJECT_ID") else "NOT SET",
+                "FIREBASE_CLIENT_EMAIL": "SET" if os.environ.get("FIREBASE_CLIENT_EMAIL") else "NOT SET",
+            }
+        })
+
     @app.route('/debug/firebase', methods=['GET'])
     def debug_firebase():
-        steps = []
-        
-        # Step 1: Check individual env vars
-        required = ["FIREBASE_PROJECT_ID", "FIREBASE_PRIVATE_KEY", "FIREBASE_CLIENT_EMAIL", "FIREBASE_DATABASE_URL"]
-        missing = [r for r in required if not os.environ.get(r)]
-        
-        steps.append({
-            "step": "check_env_vars",
-            "missing": missing,
-            "all_present": len(missing) == 0
-        })
-        
-        if missing:
-            return jsonify({
-                "success": False,
-                "error": f"Missing env vars: {', '.join(missing)}",
-                "steps": steps
-            }), 500
-        
-        # Step 2: Check private key format
-        private_key = os.environ.get("FIREBASE_PRIVATE_KEY", "")
-        has_begin = "-----BEGIN PRIVATE KEY-----" in private_key
-        has_end = "-----END PRIVATE KEY-----" in private_key
-        has_newlines = "\n" in private_key
-        
-        steps.append({
-            "step": "check_private_key",
-            "has_begin": has_begin,
-            "has_end": has_end,
-            "has_newlines": has_newlines,
-            "length": len(private_key)
-        })
-        
-        if not has_begin or not has_end:
-            return jsonify({
-                "success": False,
-                "error": "Private key is missing BEGIN/END markers. Paste the full key including the ----- lines.",
-                "steps": steps
-            }), 500
-        
-        # Step 3: Try init
-        try:
-            import firebase_admin
-            from firebase_admin import credentials, db
-            
-            # Fix newlines if needed
-            fixed_key = private_key
-            if "\\n" in fixed_key:
-                fixed_key = fixed_key.replace("\\n", "\n")
-                steps.append({"step": "fixed_newlines", "was_escaped": True})
-            
+        """Full Firebase test."""
+        result = {
+            "success": False,
+            "steps": []
+        }
+
+        # Step 1: Find credentials
+        secret_path = "/etc/secrets/firebase-credentials.json"
+        local_path = "firebase-credentials.json"
+        creds_source = None
+        cred_dict = None
+
+        if os.path.exists(secret_path):
+            creds_source = "secret_file"
+            try:
+                with open(secret_path) as f:
+                    cred_dict = json.load(f)
+                result["steps"].append({
+                    "step": "load_secret_file",
+                    "success": True,
+                    "project_id": cred_dict.get("project_id", "?"),
+                    "client_email": cred_dict.get("client_email", "?")[:50]
+                })
+            except Exception as e:
+                result["steps"].append({
+                    "step": "load_secret_file",
+                    "success": False,
+                    "error": str(e)
+                })
+                result["error"] = f"Failed to parse Secret File: {e}"
+                return jsonify(result), 500
+
+        elif os.path.exists(local_path):
+            creds_source = "local_file"
+            try:
+                with open(local_path) as f:
+                    cred_dict = json.load(f)
+                result["steps"].append({
+                    "step": "load_local_file",
+                    "success": True,
+                    "project_id": cred_dict.get("project_id", "?")
+                })
+            except Exception as e:
+                result["steps"].append({
+                    "step": "load_local_file",
+                    "success": False,
+                    "error": str(e)
+                })
+                result["error"] = f"Failed to parse local file: {e}"
+                return jsonify(result), 500
+
+        elif os.environ.get("FIREBASE_CREDENTIALS"):
+            creds_source = "env_single"
+            try:
+                cred_dict = json.loads(os.environ["FIREBASE_CREDENTIALS"])
+                result["steps"].append({
+                    "step": "load_env_single",
+                    "success": True,
+                    "project_id": cred_dict.get("project_id", "?")
+                })
+            except Exception as e:
+                result["steps"].append({
+                    "step": "load_env_single",
+                    "success": False,
+                    "error": str(e)
+                })
+                result["error"] = f"Failed to parse FIREBASE_CREDENTIALS: {e}"
+                return jsonify(result), 500
+
+        elif os.environ.get("FIREBASE_PRIVATE_KEY"):
+            creds_source = "env_individual"
+            pk = os.environ["FIREBASE_PRIVATE_KEY"].replace("\\n", "\n")
             cred_dict = {
                 "type": os.environ.get("FIREBASE_TYPE", "service_account"),
-                "project_id": os.environ.get("FIREBASE_PROJECT_ID"),
+                "project_id": os.environ.get("FIREBASE_PROJECT_ID", ""),
                 "private_key_id": os.environ.get("FIREBASE_PRIVATE_KEY_ID", ""),
-                "private_key": fixed_key,
-                "client_email": os.environ.get("FIREBASE_CLIENT_EMAIL"),
+                "private_key": pk,
+                "client_email": os.environ.get("FIREBASE_CLIENT_EMAIL", ""),
                 "client_id": os.environ.get("FIREBASE_CLIENT_ID", ""),
                 "token_uri": os.environ.get("FIREBASE_TOKEN_URI", "https://oauth2.googleapis.com/token"),
                 "auth_uri": "https://accounts.google.com/o/oauth2/auth",
                 "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-                "client_x509_cert_url": f"https://www.googleapis.com/robot/v1/metadata/x509/{os.environ.get('FIREBASE_CLIENT_EMAIL', '').replace('@', '%40')}",
+                "client_x509_cert_url": (
+                    "https://www.googleapis.com/robot/v1/metadata/x509/"
+                    + os.environ.get("FIREBASE_CLIENT_EMAIL", "").replace("@", "%40")
+                ),
             }
-            
+            result["steps"].append({
+                "step": "build_from_individual_env_vars",
+                "success": True,
+                "project_id": cred_dict.get("project_id", "?")
+            })
+
+        else:
+            result["error"] = (
+                "No credentials found. Options:\n"
+                "1. Add a Secret File at /etc/secrets/firebase-credentials.json\n"
+                "2. Add firebase-credentials.json to the project\n"
+                "3. Set FIREBASE_CREDENTIALS env var\n"
+                "4. Set FIREBASE_PRIVATE_KEY + FIREBASE_CLIENT_EMAIL + FIREBASE_PROJECT_ID"
+            )
+            result["steps"].append({"step": "find_credentials", "error": "None found"})
+            return jsonify(result), 500
+
+        result["steps"].append({
+            "step": "credentials_source",
+            "source": creds_source
+        })
+
+        # Step 2: Check private key format
+        pk = cred_dict.get("private_key", "")
+        result["steps"].append({
+            "step": "check_private_key",
+            "has_begin": "-----BEGIN PRIVATE KEY-----" in pk,
+            "has_end": "-----END PRIVATE KEY-----" in pk,
+            "length": len(pk)
+        })
+
+        # Step 3: Initialize Firebase
+        try:
+            import firebase_admin
+            from firebase_admin import credentials, db
+
             try:
-                app_obj = firebase_admin.get_app()
-                steps.append({"step": "firebase_init", "already_initialized": True})
-            except ValueError:
-                cred = credentials.Certificate(cred_dict)
-                firebase_admin.initialize_app(cred, {
-                    "databaseURL": os.environ.get("FIREBASE_DATABASE_URL")
+                existing = firebase_admin.get_app()
+                result["steps"].append({
+                    "step": "firebase_app",
+                    "status": "already_initialized",
+                    "name": existing.name
                 })
-                steps.append({"step": "firebase_init", "initialized_now": True})
-            
-            # Step 4: Test DB read
-            ref = db.reference('/')
-            kr_tags = ref.child('kr_tags').get()
-            steps.append({
+            except ValueError:
+                db_url = os.environ.get("FIREBASE_DATABASE_URL") or cred_dict.get("databaseURL")
+                if not db_url:
+                    result["error"] = "FIREBASE_DATABASE_URL not set"
+                    result["steps"].append({"step": "firebase_app", "error": "No database URL"})
+                    return jsonify(result), 500
+
+                firebase_admin.initialize_app(
+                    credentials.Certificate(cred_dict),
+                    {"databaseURL": db_url}
+                )
+                result["steps"].append({
+                    "step": "firebase_app",
+                    "status": "initialized_now",
+                    "database_url": db_url[:50] + "..."
+                })
+
+            # Step 4: Test database read
+            ref = db.reference("/")
+            kr_tags = ref.child("kr_tags").get()
+            users = ref.child("users").get()
+
+            result["steps"].append({
                 "step": "db_read",
                 "success": True,
-                "kr_tags": kr_tags
+                "kr_tags_count": len(kr_tags) if kr_tags else 0,
+                "users_count": len(users) if users else 0
             })
-            
-            return jsonify({
-                "success": True,
-                "message": "Firebase is fully working",
-                "steps": steps
-            })
-            
+
+            result["success"] = True
+            result["message"] = "Firebase is fully operational. Ready to sign up users."
+
         except Exception as e:
-            steps.append({
-                "step": "error",
-                "error": str(e),
-                "traceback": traceback.format_exc()[-500:]
-            })
-            return jsonify({
+            result["steps"].append({
+                "step": "firebase_init_or_db_read",
                 "success": False,
                 "error": str(e),
-                "steps": steps
-            }), 500
-    
-    # ═══════════ REGISTER BLUEPRINTS ═══════════
+                "traceback_tail": traceback.format_exc()[-400:]
+            })
+            result["error"] = str(e)
+            return jsonify(result), 500
+
+        return jsonify(result)
+
+    # ═══════════════════════════════
+    # REGISTER BLUEPRINTS
+    # ═══════════════════════════════
+    blueprint_error = None
     try:
         from auth.routes import auth_bp
         from wallet.routes import wallet_bp
@@ -159,38 +233,53 @@ def create_app():
         app.register_blueprint(wallet_bp)
         print("Blueprints registered successfully.")
     except Exception as e:
-        print(f"WARNING: Could not register blueprints: {e}")
-        
+        blueprint_error = str(e)
+        print(f"WARNING: Blueprint registration failed: {e}")
+
         @app.route('/api/auth/signup', methods=['POST'])
         def fallback_signup():
             return jsonify({
                 "success": False,
-                "error": f"Server init error. Hit /debug/firebase first. ({str(e)[:200]})"
+                "error": f"Server initialization error: {blueprint_error}. Check /debug/firebase"
             }), 500
-        
+
         @app.route('/api/auth/login', methods=['POST'])
         def fallback_login():
             return jsonify({
                 "success": False,
-                "error": f"Server init error. Hit /debug/firebase first. ({str(e)[:200]})"
+                "error": f"Server initialization error: {blueprint_error}. Check /debug/firebase"
             }), 500
-    
-    # ═══════════ ERROR HANDLERS ═══════════
+
+        @app.route('/api/user/lookup', methods=['POST'])
+        @app.route('/api/wallet/balance', methods=['GET'])
+        @app.route('/api/wallet/send', methods=['POST'])
+        @app.route('/api/wallet/transactions', methods=['GET'])
+        def fallback_all():
+            return jsonify({
+                "success": False,
+                "error": f"Server initialization error: {blueprint_error}. Check /debug/firebase"
+            }), 500
+
+    # ═══════════════════════════════
+    # ERROR HANDLERS
+    # ═══════════════════════════════
     @app.errorhandler(404)
     def not_found(error):
         return jsonify({
             "success": False,
-            "error": "Endpoint not found."
+            "error": "Endpoint not found. Try /debug/status or /debug/firebase"
         }), 404
-    
+
+    @app.errorhandler(405)
+    def method_not_allowed(error):
+        return jsonify({"success": False, "error": "Method not allowed."}), 405
+
     @app.errorhandler(500)
     def internal_error(error):
-        return jsonify({
-            "success": False,
-            "error": "Internal server error."
-        }), 500
-    
+        return jsonify({"success": False, "error": "Internal server error."}), 500
+
     return app
+
 
 app = create_app()
 
