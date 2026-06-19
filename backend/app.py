@@ -8,216 +8,150 @@ def create_app():
     """Create and configure the Flask application."""
     app = Flask(__name__)
     
-    # Enable CORS for all routes
     CORS(app, resources={r"/api/*": {"origins": "*"}, r"/debug/*": {"origins": "*"}})
     
-    # ═══════════════════════════════
-    # HEALTH CHECK
-    # ═══════════════════════════════
     @app.route('/')
     def home():
         return jsonify({
             "status": "ok",
             "app": "Kerion Wallet API",
-            "version": "1.0.1"
+            "version": "1.0.2"
         })
     
     @app.route('/health')
     def health():
         return jsonify({"status": "healthy"}), 200
     
-    # ═══════════════════════════════
-    # DEBUG ENDPOINTS
-    # ═══════════════════════════════
+    # ═══════════ DEBUG: Check individual env vars ═══════════
     @app.route('/debug/env', methods=['GET'])
     def debug_env():
-        """Check which environment variables are set (values hidden for security)."""
         vars_to_check = [
-            'FIREBASE_CREDENTIALS',
+            'FIREBASE_TYPE',
+            'FIREBASE_PROJECT_ID',
+            'FIREBASE_PRIVATE_KEY_ID',
+            'FIREBASE_PRIVATE_KEY',
+            'FIREBASE_CLIENT_EMAIL',
+            'FIREBASE_CLIENT_ID',
+            'FIREBASE_TOKEN_URI',
             'FIREBASE_DATABASE_URL',
             'FIREBASE_API_KEY',
-            'PORT'
         ]
         result = {}
         for var in vars_to_check:
             val = os.environ.get(var)
-            if val:
-                # Show first 30 chars only for security
-                result[var] = f"SET (starts with: {val[:30]}...)"
-            else:
+            if not val:
                 result[var] = "NOT SET"
+            elif var == 'FIREBASE_PRIVATE_KEY':
+                # Show start and end to verify format without exposing full key
+                result[var] = f"SET (starts: {val[:25]}... ends: ...{val[-25:]})"
+            else:
+                result[var] = f"SET ({val[:40]}{'...' if len(val) > 40 else ''})"
         return jsonify({"success": True, "environment": result})
     
     @app.route('/debug/firebase', methods=['GET'])
     def debug_firebase():
-        """Test Firebase initialization step by step."""
         steps = []
         
-        # Step 1: Check environment
-        creds_set = bool(os.environ.get('FIREBASE_CREDENTIALS'))
-        db_url_set = bool(os.environ.get('FIREBASE_DATABASE_URL'))
+        # Step 1: Check individual env vars
+        required = ["FIREBASE_PROJECT_ID", "FIREBASE_PRIVATE_KEY", "FIREBASE_CLIENT_EMAIL", "FIREBASE_DATABASE_URL"]
+        missing = [r for r in required if not os.environ.get(r)]
+        
         steps.append({
-            "step": "environment",
-            "credentials_set": creds_set,
-            "database_url_set": db_url_set
+            "step": "check_env_vars",
+            "missing": missing,
+            "all_present": len(missing) == 0
         })
         
-        if not creds_set:
+        if missing:
             return jsonify({
                 "success": False,
-                "error": "FIREBASE_CREDENTIALS not set",
+                "error": f"Missing env vars: {', '.join(missing)}",
                 "steps": steps
             }), 500
         
-        if not db_url_set:
+        # Step 2: Check private key format
+        private_key = os.environ.get("FIREBASE_PRIVATE_KEY", "")
+        has_begin = "-----BEGIN PRIVATE KEY-----" in private_key
+        has_end = "-----END PRIVATE KEY-----" in private_key
+        has_newlines = "\n" in private_key
+        
+        steps.append({
+            "step": "check_private_key",
+            "has_begin": has_begin,
+            "has_end": has_end,
+            "has_newlines": has_newlines,
+            "length": len(private_key)
+        })
+        
+        if not has_begin or not has_end:
             return jsonify({
                 "success": False,
-                "error": "FIREBASE_DATABASE_URL not set",
+                "error": "Private key is missing BEGIN/END markers. Paste the full key including the ----- lines.",
                 "steps": steps
             }), 500
         
-        # Step 2: Try parsing credentials
-        try:
-            import json
-            creds_str = os.environ.get('FIREBASE_CREDENTIALS')
-            creds_dict = json.loads(creds_str)
-            steps.append({
-                "step": "parse_credentials",
-                "success": True,
-                "project_id": creds_dict.get('project_id', 'NOT FOUND'),
-                "client_email": creds_dict.get('client_email', 'NOT FOUND')[:40] + '...',
-                "has_private_key": 'private_key' in creds_dict
-            })
-        except json.JSONDecodeError as e:
-            steps.append({
-                "step": "parse_credentials",
-                "success": False,
-                "error": f"Invalid JSON: {str(e)}",
-                "first_100_chars": creds_str[:100] if creds_set else "N/A"
-            })
-            return jsonify({
-                "success": False,
-                "error": "FIREBASE_CREDENTIALS is not valid JSON",
-                "steps": steps
-            }), 500
-        
-        # Step 3: Try initializing Firebase
+        # Step 3: Try init
         try:
             import firebase_admin
             from firebase_admin import credentials, db
             
-            # Check if already initialized
+            # Fix newlines if needed
+            fixed_key = private_key
+            if "\\n" in fixed_key:
+                fixed_key = fixed_key.replace("\\n", "\n")
+                steps.append({"step": "fixed_newlines", "was_escaped": True})
+            
+            cred_dict = {
+                "type": os.environ.get("FIREBASE_TYPE", "service_account"),
+                "project_id": os.environ.get("FIREBASE_PROJECT_ID"),
+                "private_key_id": os.environ.get("FIREBASE_PRIVATE_KEY_ID", ""),
+                "private_key": fixed_key,
+                "client_email": os.environ.get("FIREBASE_CLIENT_EMAIL"),
+                "client_id": os.environ.get("FIREBASE_CLIENT_ID", ""),
+                "token_uri": os.environ.get("FIREBASE_TOKEN_URI", "https://oauth2.googleapis.com/token"),
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+                "client_x509_cert_url": f"https://www.googleapis.com/robot/v1/metadata/x509/{os.environ.get('FIREBASE_CLIENT_EMAIL', '').replace('@', '%40')}",
+            }
+            
             try:
                 app_obj = firebase_admin.get_app()
-                steps.append({
-                    "step": "firebase_init",
-                    "already_initialized": True,
-                    "app_name": app_obj.name
-                })
+                steps.append({"step": "firebase_init", "already_initialized": True})
             except ValueError:
-                # Not initialized - do it now
-                cred = credentials.Certificate(creds_dict)
-                database_url = os.environ.get('FIREBASE_DATABASE_URL')
-                
+                cred = credentials.Certificate(cred_dict)
                 firebase_admin.initialize_app(cred, {
-                    'databaseURL': database_url
+                    "databaseURL": os.environ.get("FIREBASE_DATABASE_URL")
                 })
-                steps.append({
-                    "step": "firebase_init",
-                    "already_initialized": False,
-                    "initialized_now": True,
-                    "database_url": database_url
-                })
-        except Exception as e:
-            steps.append({
-                "step": "firebase_init",
-                "success": False,
-                "error": str(e),
-                "traceback": traceback.format_exc()
-            })
-            return jsonify({
-                "success": False,
-                "error": f"Firebase init failed: {str(e)}",
-                "steps": steps
-            }), 500
-        
-        # Step 4: Try reading from DB
-        try:
+                steps.append({"step": "firebase_init", "initialized_now": True})
+            
+            # Step 4: Test DB read
             ref = db.reference('/')
             kr_tags = ref.child('kr_tags').get()
             steps.append({
                 "step": "db_read",
                 "success": True,
-                "kr_tags": kr_tags,
-                "kr_tags_type": str(type(kr_tags))
+                "kr_tags": kr_tags
             })
-        except Exception as e:
-            steps.append({
-                "step": "db_read",
-                "success": False,
-                "error": str(e),
-                "traceback": traceback.format_exc()
-            })
-            return jsonify({
-                "success": False,
-                "error": f"Database read failed: {str(e)}",
-                "steps": steps
-            }), 500
-        
-        return jsonify({
-            "success": True,
-            "message": "Firebase is fully working",
-            "steps": steps
-        })
-    
-    @app.route('/debug/signup-test', methods=['GET'])
-    def debug_signup_test():
-        """Simulate kr_tag generation without creating a user."""
-        try:
-            import random
-            import string
-            from firebase_admin import db
-            
-            kr_tags_ref = db.reference('kr_tags')
-            
-            # Generate 5 test tags and check Firebase
-            results = []
-            for i in range(5):
-                digits = ''.join(random.choices(string.digits, k=10))
-                kr_tag = f"kr-{digits}"
-                
-                try:
-                    existing = kr_tags_ref.child(kr_tag).get()
-                    results.append({
-                        "tag": kr_tag,
-                        "exists": existing is not None,
-                        "existing_uid": existing if existing else None
-                    })
-                except Exception as e:
-                    results.append({
-                        "tag": kr_tag,
-                        "error": str(e)
-                    })
-            
-            # Try to read the entire kr_tags node
-            all_tags = kr_tags_ref.get()
             
             return jsonify({
                 "success": True,
-                "test_tags": results,
-                "all_existing_tags": all_tags,
-                "existing_count": len(all_tags) if all_tags else 0
+                "message": "Firebase is fully working",
+                "steps": steps
             })
+            
         except Exception as e:
+            steps.append({
+                "step": "error",
+                "error": str(e),
+                "traceback": traceback.format_exc()[-500:]
+            })
             return jsonify({
                 "success": False,
                 "error": str(e),
-                "traceback": traceback.format_exc()
+                "steps": steps
             }), 500
     
-    # ═══════════════════════════════
-    # TRY TO IMPORT AND REGISTER BLUEPRINTS
-    # ═══════════════════════════════
+    # ═══════════ REGISTER BLUEPRINTS ═══════════
     try:
         from auth.routes import auth_bp
         from wallet.routes import wallet_bp
@@ -226,50 +160,38 @@ def create_app():
         print("Blueprints registered successfully.")
     except Exception as e:
         print(f"WARNING: Could not register blueprints: {e}")
-        traceback.print_exc()
         
-        # Create fallback routes so API doesn't 404
         @app.route('/api/auth/signup', methods=['POST'])
         def fallback_signup():
             return jsonify({
                 "success": False,
-                "error": f"Server initialization error. Check /debug/firebase. Details: {str(e)}"
+                "error": f"Server init error. Hit /debug/firebase first. ({str(e)[:200]})"
             }), 500
         
         @app.route('/api/auth/login', methods=['POST'])
         def fallback_login():
             return jsonify({
                 "success": False,
-                "error": f"Server initialization error. Check /debug/firebase. Details: {str(e)}"
+                "error": f"Server init error. Hit /debug/firebase first. ({str(e)[:200]})"
             }), 500
     
-    # ═══════════════════════════════
-    # ERROR HANDLERS
-    # ═══════════════════════════════
+    # ═══════════ ERROR HANDLERS ═══════════
     @app.errorhandler(404)
     def not_found(error):
         return jsonify({
             "success": False,
-            "error": "Endpoint not found. Available: /debug/env, /debug/firebase, /debug/signup-test, /api/auth/signup, /api/auth/login, /api/wallet/*"
+            "error": "Endpoint not found."
         }), 404
-    
-    @app.errorhandler(405)
-    def method_not_allowed(error):
-        return jsonify({
-            "success": False,
-            "error": "Method not allowed."
-        }), 405
     
     @app.errorhandler(500)
     def internal_error(error):
         return jsonify({
             "success": False,
-            "error": f"Internal server error: {str(error)}"
+            "error": "Internal server error."
         }), 500
     
     return app
 
-# Create the app instance
 app = create_app()
 
 if __name__ == '__main__':
