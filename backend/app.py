@@ -15,9 +15,11 @@ def create_app():
     # Register blueprints
     from auth.routes import auth_bp
     from wallet.routes import wallet_bp
+    from offline_routes import offline_bp
 
     app.register_blueprint(auth_bp)
     app.register_blueprint(wallet_bp)
+    app.register_blueprint(offline_bp)
 
     # ── Health check ──────────────────────────────────────
     @app.route('/')
