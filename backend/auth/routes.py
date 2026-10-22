@@ -163,12 +163,24 @@ def login():
         auth_data = auth_response.json()
         
         if auth_response.status_code != 200:
-            error_msg = auth_data.get('error', {}).get('message', 'Login failed.')
-            if 'EMAIL_NOT_FOUND' in error_msg or 'INVALID_PASSWORD' in error_msg:
-                return error_response("Invalid email or password.")
-            if 'USER_DISABLED' in error_msg:
-                return error_response("This account has been disabled.")
-            return error_response(f"Login failed: {error_msg}")
+    error_obj = auth_data.get('error', {})
+    error_msg = error_obj.get('message', '')
+    codes = [e.get('message', '') for e in error_obj.get('errors', [])]
+    combined = ' '.join([error_msg, *codes]).upper()
+
+    if any(c in combined for c in (
+        'EMAIL_NOT_FOUND', 'INVALID_PASSWORD', 'INVALID_LOGIN_CREDENTIALS'
+    )):
+        return error_response("Invalid email or password.", status=401)
+
+    if 'USER_DISABLED' in combined:
+        return error_response("This account has been disabled.", status=403)
+
+    if 'TOO_MANY_ATTEMPTS_TRY_LATER' in combined:
+        return error_response("Too many attempts. Try again later.", status=429)
+
+    logger.warning("Unhandled Firebase auth error: %s", error_msg)
+    return error_response("Login failed. Please try again.", status=401)
         
         uid = auth_data['localId']
         id_token = auth_data['idToken']
