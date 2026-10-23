@@ -2,12 +2,16 @@ import math
 from flask import Blueprint, request, g
 from datetime import datetime, timezone
 import hashlib
-from firebase_admin import messaging
 import uuid
+
+try:
+    from firebase_admin import messaging
+except ImportError:  # pragma: no cover - optional dependency in some environments
+    messaging = None
 
 from firebase_config import get_db_ref
 from utils.helpers import (
-    verify_pin, error_response, success_response, validate_pin
+    check_pin, error_response, success_response, validate_pin
 )
 from utils.auth_middleware import require_auth
 
@@ -154,15 +158,16 @@ def send_money():
 
         db_ref = get_db_ref()
 
-        # 1. Verify sender's PIN
+        # 1. Verify sender's PIN (rate-limited: 5 wrong guesses lock it)
         sender_ref = db_ref.child("users").child(g.user_id)
         sender_data = sender_ref.get()
 
         if not sender_data:
             return error_response("Sender account not found.", 404)
 
-        if not verify_pin(pin, sender_data.get('pin_hash', '')):
-            return error_response("Incorrect PIN.", 401)
+        pin_error = check_pin(g.user_id, pin, sender_data.get('pin_hash'))
+        if pin_error:
+            return pin_error
 
         # 2. Look up recipient by kr_tag
         kr_tags_ref = db_ref.child("kr_tags")
@@ -281,10 +286,10 @@ def topup_wallet():
         if not validate_pin(pin):
             return error_response("PIN must be exactly 4 digits.")
         try:
-            amount = float(amount)
+            amount = round(float(amount), 2)
         except (TypeError, ValueError):
             return error_response("Amount must be a valid number.")
-        if amount < 100:
+        if not math.isfinite(amount) or amount < 100:
             return error_response("Minimum top-up amount is 100.")
         if amount > 1000000:
             return error_response("Top-up amount exceeds the maximum limit of 1,000,000.")
@@ -294,21 +299,38 @@ def topup_wallet():
         user_data = user_ref.get()
         if not user_data:
             return error_response("User account not found.", 404)
-        if not verify_pin(pin, user_data.get('pin_hash', '')):
-            return error_response("Incorrect PIN.", 401)
 
-        new_balance = round(float(user_data.get('balance', 0)) + amount, 2)
+        pin_error = check_pin(g.user_id, pin, user_data.get('pin_hash'))
+        if pin_error:
+            return pin_error
+
+        # Add inside a transaction so a concurrent send is never overwritten.
+        state = {}
+
+        def add(balance):
+            state["new_balance"] = round(float(balance or 0) + amount, 2)
+            return state["new_balance"]
+
+        try:
+            user_ref.child('balance').transaction(add)
+        except Exception as e:
+            print(f"Top-up transaction failed: {e}")
+            return error_response("Top-up failed. Please try again.", 500)
+
+        new_balance = state["new_balance"]
         transaction_id = str(uuid.uuid4())
         timestamp = datetime.now(timezone.utc).isoformat()
-        user_ref.child('balance').set(new_balance)
-        db_ref.child("transactions").child(g.user_id).child(transaction_id).set({
-            "type": "topup",
-            "amount": amount,
-            "counterparty_name": "Testnet",
-            "timestamp": timestamp,
-            "status": "completed",
-            "description": "Simulated testnet top-up",
-        })
+        try:
+            db_ref.child("transactions").child(g.user_id).child(transaction_id).set({
+                "type": "topup",
+                "amount": amount,
+                "counterparty_name": "Testnet",
+                "timestamp": timestamp,
+                "status": "completed",
+                "description": "Simulated testnet top-up",
+            })
+        except Exception as e:
+            print(f"CRITICAL: history write failed for top-up {transaction_id}: {e}")
 
         return success_response({
             "transaction_id": transaction_id,
@@ -317,7 +339,8 @@ def topup_wallet():
             "timestamp": timestamp,
         })
     except Exception as e:
-        return error_response(f"Top-up failed: {str(e)}", 500)
+        print(f"Top-up failed: {e}")
+        return error_response("Top-up failed. Please try again.", 500)
 
 
 @wallet_bp.route('/api/device/register', methods=['POST'])
