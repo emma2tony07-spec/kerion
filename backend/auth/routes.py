@@ -4,7 +4,7 @@ import os
 from firebase_config import get_db_ref
 from utils.helpers import (
     hash_pin, generate_kr_tag, error_response,
-    success_response, validate_pin, validate_email, validate_phone
+    success_response, validate_pin, validate_email, validate_phone, write_lookup_indexes
 )
 from datetime import datetime, timezone
 
@@ -137,6 +137,10 @@ def signup():
         db_ref = get_db_ref()
         db_ref.child("users").child(uid).set(user_data)
         db_ref.child("kr_tags").child(kr_tag).set(uid)
+        try:
+            write_lookup_indexes(uid, email, phone)
+        except Exception:
+            current_app.logger.exception("Lookup index write failed for uid=%s", uid)
         completed = True
 
         # 5. Token, refresh token and profile
