@@ -59,36 +59,64 @@ def _distance_meters(first, second):
 
 
 def _issue_or_refresh_permit(uid, location):
-    """Maintain one active, server-held ₦2,000 reserve per enrolled device."""
-    permit_ref = get_db_ref(f"offline_permits/{uid}")
-    existing = permit_ref.get() or {}
-    expires_at = _now() + timedelta(days=PERMIT_DAYS)
-    if existing.get("status") == "active" and existing.get("expires_at", "") > _now().isoformat():
-        existing["last_location"] = location
-        permit_ref.update({"last_location": location})
-        return existing
+    """Keep one active, server-held reserve (up to ₦2,000) per user.
 
-    user_ref = get_db_ref(f"users/{uid}")
-    user = user_ref.get() or {}
-    balance_kobo = int(round(float(user.get("balance", 0)) * 100))
-    reserve = min(OFFLINE_LIMIT_KOBO, balance_kobo)
-    if reserve <= 0:
-        raise ValueError("No available balance can be reserved for offline payments.")
+    Runs as ONE root transaction so the balance deduction and the permit
+    write are indivisible: concurrent enrollments cannot issue two permits,
+    and a concurrent send cannot be overwritten. An expired permit's unspent
+    remainder is returned to the balance before a new reserve is taken.
+    """
+    result = {}
 
-    # The reserve is removed from spendable online balance before any offline
-    # offer can exist. Redemption can therefore never overdraw the account.
-    user_ref.update({"balance": round((balance_kobo - reserve) / 100, 2)})
-    permit = {
-        "permit_id": secrets.token_urlsafe(24),
-        "status": "active",
-        "reserved_kobo": reserve,
-        "remaining_kobo": reserve,
-        "pending_offer_ids": [],
-        "expires_at": expires_at.isoformat(),
-        "last_location": location,
-    }
-    permit_ref.set(permit)
-    return permit
+    def issue(state):
+        result.clear()  # the callback may be re-run on conflicts
+        state = state or {}
+        permits = state.get("offline_permits") or {}
+        users = state.get("users") or {}
+        existing = permits.get(uid) or {}
+
+        if (existing.get("status") == "active"
+                and existing.get("expires_at", "") > _now().isoformat()):
+            existing["last_location"] = location
+            permits[uid] = existing
+            state["offline_permits"] = permits
+            result["permit"] = existing
+            return state
+
+        user = users.get(uid)
+        if not isinstance(user, dict):
+            result["error"] = "Account not found."
+            return state
+
+        balance_kobo = int(round(float(user.get("balance") or 0) * 100))
+        # Whatever the old permit never spent goes back to the balance first.
+        balance_kobo += max(0, int(existing.get("remaining_kobo") or 0))
+        reserve = min(OFFLINE_LIMIT_KOBO, balance_kobo)
+        if reserve <= 0:
+            result["error"] = "No available balance can be reserved for offline payments."
+            return state
+
+        user["balance"] = round((balance_kobo - reserve) / 100, 2)
+        users[uid] = user
+        permit = {
+            "permit_id": secrets.token_urlsafe(24),
+            "status": "active",
+            "reserved_kobo": reserve,
+            "remaining_kobo": reserve,
+            "pending_offer_ids": [],
+            "expires_at": (_now() + timedelta(days=PERMIT_DAYS)).isoformat(),
+            "last_location": location,
+        }
+        permits[uid] = permit
+        state["users"] = users
+        state["offline_permits"] = permits
+        result["permit"] = permit
+        return state
+
+    get_db_ref().transaction(issue)
+    if "error" in result:
+        raise ValueError(result["error"])
+    return result["permit"]
 
 
 @offline_bp.route("/api/offline/enroll", methods=["POST"])
@@ -119,8 +147,11 @@ def enroll_device():
                                  "max_pending_offers": MAX_PENDING_OFFERS})
     except ValueError as exc:
         return error_response(str(exc), 400)
+    except firebase_db.TransactionAbortedError:
+        return error_response("The server is busy. Please try again.", 503)
     except Exception as exc:
-        return error_response(f"Offline enrollment failed: {exc}", 500)
+        print(f"Offline enrollment failed: {exc}")
+        return error_response("Offline enrollment failed. Please try again.", 500)
 
 
 _REQUIRED_FIELDS = {
