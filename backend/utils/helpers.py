@@ -2,6 +2,7 @@ import re
 import secrets
 import string
 import time
+import hashlib
 from math import ceil
 
 import bcrypt
@@ -10,6 +11,65 @@ from firebase_config import get_db_ref
 PIN_MAX_ATTEMPTS = 5
 PIN_LOCK_SECONDS = 15 * 60
 
+# ─── Lookup indexes and rate limiting ─────────────────────────────
+
+LOOKUP_MAX_PER_MINUTE = 30
+
+
+def _index_key(value):
+    return hashlib.sha256(value.encode('utf-8')).hexdigest()
+
+
+def normalize_email(email):
+    return email.strip().lower() if isinstance(email, str) else ''
+
+
+def normalize_phone(phone):
+    return re.sub(r'\D', '', phone) if isinstance(phone, str) else ''
+
+
+def email_index_key(email):
+    return _index_key(normalize_email(email))
+
+
+def phone_index_key(phone):
+    return _index_key(normalize_phone(phone))
+
+
+def write_lookup_indexes(uid, email, phone):
+    """Point the email and phone indexes at this user."""
+    db = get_db_ref()
+    if normalize_email(email):
+        db.child("emails").child(email_index_key(email)).set(uid)
+    if normalize_phone(phone):
+        db.child("phones").child(phone_index_key(phone)).set(uid)
+
+
+def lookup_allowed(uid):
+    """Fixed-window limiter. Fails closed if the counter can't be read."""
+    ref = get_db_ref(f"lookup_limits/{uid}")
+    outcome = {}
+
+    def tx(current):
+        outcome.clear()
+        cur = current if isinstance(current, dict) else {}
+        now = time.time()
+        start = float(cur.get("window_start") or 0)
+        count = int(cur.get("count") or 0)
+        if now - start >= 60:
+            start, count = now, 0
+        if count >= LOOKUP_MAX_PER_MINUTE:
+            outcome["ok"] = False
+            return {"window_start": start, "count": count}
+        outcome["ok"] = True
+        return {"window_start": start, "count": count + 1}
+
+    try:
+        ref.transaction(tx)
+    except Exception as e:
+        print(f"Lookup limiter failed: {e}")
+        return False
+    return outcome.get("ok", False)
 
 def hash_pin(pin):
     """Hash a 4-digit PIN using bcrypt."""
