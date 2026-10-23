@@ -33,8 +33,11 @@ def generate_kr_tag():
     
     raise Exception("Failed to generate unique kr_tag after maximum attempts.")
 
-def error_response(message, status_code=400):
-    return {"success": False, "error": message}, status_code
+def error_response(message, status_code=400, code=None):
+    body = {"success": False, "error": message}
+    if code:
+        body["code"] = code
+    return body, status_code
 
 def success_response(data, status_code=200):
     return {"success": True, "data": data}, status_code
