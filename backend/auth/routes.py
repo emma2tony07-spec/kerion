@@ -10,8 +10,9 @@ from datetime import datetime, timezone
 
 auth_bp = Blueprint('auth', __name__)
 
-# Firebase Auth REST API endpoint
+# Firebase Auth REST API endpoints
 FIREBASE_AUTH_URL = "https://identitytoolkit.googleapis.com/v1/accounts"
+FIREBASE_TOKEN_URL = "https://securetoken.googleapis.com/v1/token"
 FIREBASE_API_KEY = os.environ.get("FIREBASE_API_KEY", "")
 
 
@@ -24,34 +25,54 @@ def _extract_firebase_error(auth_data):
     return error_msg, combined
 
 
+def _text(data, key):
+    """Read a string field; anything that isn't a string becomes ''."""
+    value = data.get(key, '')
+    return value.strip() if isinstance(value, str) else ''
+
+
+def _profile(uid, user_data):
+    """Client-safe profile returned by login and signup."""
+    return {
+        "uid": uid,
+        "name": user_data.get('name'),
+        "email": user_data.get('email'),
+        "phone": user_data.get('phone'),
+        "dob": user_data.get('dob'),
+        "nationality": user_data.get('nationality'),
+        "kr_tag": user_data.get('kr_tag'),
+        "balance": user_data.get('balance', 0.00),
+    }
+
+
 @auth_bp.route('/api/auth/signup', methods=['POST'])
 def signup():
     """Register a new user with Firebase Auth and store profile in Realtime DB."""
     uid = None
     id_token = None
+    completed = False
     try:
-        data = request.get_json()
+        data = request.get_json(silent=True)
 
-        if not data:
+        if not isinstance(data, dict) or not data:
             return error_response("Request body is required.", 400)
 
-        # Extract fields
-        email = data.get('email', '').strip().lower()
+        email = _text(data, 'email').lower()
         password = data.get('password', '')
-        name = data.get('name', '').strip()
-        phone = data.get('phone', '').strip()
-        dob = data.get('dob', '').strip()
-        nationality = data.get('nationality', '').strip()
+        password = password if isinstance(password, str) else ''
+        name = _text(data, 'name')
+        phone = _text(data, 'phone')
+        dob = _text(data, 'dob')
+        nationality = _text(data, 'nationality')
         pin = data.get('pin', '')
+        pin = pin if isinstance(pin, str) else ''
 
-        # Validate required fields
         if not all([email, password, name, phone, dob, nationality, pin]):
             return error_response(
                 "All fields are required: email, password, name, phone, dob, nationality, pin.",
                 400
             )
 
-        # Validate formats
         if not validate_email(email):
             return error_response("Invalid email format.", 400)
 
@@ -68,18 +89,13 @@ def signup():
             current_app.logger.error("FIREBASE_API_KEY is not configured.")
             return error_response("Server configuration error. Please contact support.", 500)
 
-        # 1. Create user in Firebase Auth using REST API
+        # 1. Create the user in Firebase Auth
         auth_response = requests.post(
             f"{FIREBASE_AUTH_URL}:signUp",
             params={"key": FIREBASE_API_KEY},
-            json={
-                "email": email,
-                "password": password,
-                "returnSecureToken": True
-            },
+            json={"email": email, "password": password, "returnSecureToken": True},
             timeout=10
         )
-
         auth_data = auth_response.json()
 
         if auth_response.status_code != 200:
@@ -99,14 +115,13 @@ def signup():
 
         uid = auth_data['localId']
         id_token = auth_data['idToken']
+        refresh_token = auth_data.get('refreshToken')
 
-        # 2. Generate unique kr_tag
+        # 2. Unique kr_tag, 3. hashed PIN
         kr_tag = generate_kr_tag()
-
-        # 3. Hash the PIN
         pin_hash = hash_pin(pin)
 
-        # 4. Create user profile in Realtime Database
+        # 4. Profile in Realtime Database
         user_data = {
             "email": email,
             "name": name,
@@ -122,17 +137,13 @@ def signup():
         db_ref = get_db_ref()
         db_ref.child("users").child(uid).set(user_data)
         db_ref.child("kr_tags").child(kr_tag).set(uid)
+        completed = True
 
-        # 5. Return success with token and user info
+        # 5. Token, refresh token and profile
         return success_response({
             "token": id_token,
-            "user": {
-                "uid": uid,
-                "name": name,
-                "email": email,
-                "kr_tag": kr_tag,
-                "balance": 0.00
-            }
+            "refresh_token": refresh_token,
+            "user": _profile(uid, user_data),
         }, 201)
 
     except requests.exceptions.RequestException:
@@ -142,9 +153,9 @@ def signup():
         current_app.logger.exception("Unexpected error during signup.")
         return error_response("An unexpected error occurred. Please try again.", 500)
     finally:
-        # Cleanup: if we created the auth user but failed before completing the profile
-        # write, roll back the auth user so the email isn't orphaned.
-        if uid and id_token and not _signup_completed(uid):
+        # If the auth user was created but the profile write didn't finish,
+        # roll the auth user back so the email isn't orphaned.
+        if uid and id_token and not completed and not _signup_completed(uid):
             try:
                 requests.post(
                     f"{FIREBASE_AUTH_URL}:delete",
@@ -171,15 +182,16 @@ def _signup_completed(uid):
 
 @auth_bp.route('/api/auth/login', methods=['POST'])
 def login():
-    """Log in user with email and password. Returns Firebase ID token."""
+    """Log in with email and password. Returns an ID token and a refresh token."""
     try:
-        data = request.get_json()
+        data = request.get_json(silent=True)
 
-        if not data:
+        if not isinstance(data, dict) or not data:
             return error_response("Request body is required.", 400)
 
-        email = data.get('email', '').strip().lower()
+        email = _text(data, 'email').lower()
         password = data.get('password', '')
+        password = password if isinstance(password, str) else ''
 
         if not email or not password:
             return error_response("Email and password are required.", 400)
@@ -188,18 +200,12 @@ def login():
             current_app.logger.error("FIREBASE_API_KEY is not configured.")
             return error_response("Server configuration error. Please contact support.", 500)
 
-        # Authenticate with Firebase Auth REST API
         auth_response = requests.post(
             f"{FIREBASE_AUTH_URL}:signInWithPassword",
             params={"key": FIREBASE_API_KEY},
-            json={
-                "email": email,
-                "password": password,
-                "returnSecureToken": True
-            },
+            json={"email": email, "password": password, "returnSecureToken": True},
             timeout=10
         )
-
         auth_data = auth_response.json()
 
         if auth_response.status_code != 200:
@@ -221,10 +227,9 @@ def login():
 
         uid = auth_data['localId']
         id_token = auth_data['idToken']
+        refresh_token = auth_data.get('refreshToken')
 
-        # Fetch user profile from Realtime DB
-        user_ref = get_db_ref(f"users/{uid}")
-        user_data = user_ref.get()
+        user_data = get_db_ref(f"users/{uid}").get()
 
         if not user_data:
             current_app.logger.error(
@@ -236,13 +241,8 @@ def login():
 
         return success_response({
             "token": id_token,
-            "user": {
-                "uid": uid,
-                "name": user_data.get('name'),
-                "email": user_data.get('email'),
-                "kr_tag": user_data.get('kr_tag'),
-                "balance": user_data.get('balance', 0.00)
-            }
+            "refresh_token": refresh_token,
+            "user": _profile(uid, user_data),
         })
 
     except requests.exceptions.RequestException:
@@ -251,3 +251,56 @@ def login():
     except Exception:
         current_app.logger.exception("Unexpected error during login.")
         return error_response("An unexpected error occurred. Please try again.", 500)
+
+
+@auth_bp.route('/api/auth/refresh', methods=['POST'])
+def refresh():
+    """Exchange a Firebase refresh token for a fresh ID token."""
+    try:
+        data = request.get_json(silent=True)
+        data = data if isinstance(data, dict) else {}
+        refresh_token = data.get('refresh_token')
+        if not isinstance(refresh_token, str) or not refresh_token.strip():
+            return error_response("refresh_token is required.", 400)
+        refresh_token = refresh_token.strip()
+
+        if not FIREBASE_API_KEY:
+            current_app.logger.error("FIREBASE_API_KEY is not configured.")
+            return error_response("Server configuration error.", 500)
+
+        resp = requests.post(
+            FIREBASE_TOKEN_URL,
+            params={"key": FIREBASE_API_KEY},
+            data={"grant_type": "refresh_token", "refresh_token": refresh_token},
+            timeout=15,
+        )
+        try:
+            body = resp.json()
+        except ValueError:
+            body = {}
+
+        if resp.status_code != 200:
+            msg = str((body.get('error') or {}).get('message', ''))
+            definitive = ('TOKEN_EXPIRED', 'USER_DISABLED', 'USER_NOT_FOUND',
+                          'INVALID_REFRESH_TOKEN', 'MISSING_REFRESH_TOKEN',
+                          'INVALID_GRANT_TYPE')
+            if any(k in msg for k in definitive):
+                return error_response("Session expired. Please log in again.",
+                                      401, code="refresh_rejected")
+            current_app.logger.warning("Refresh failed: HTTP %s %s", resp.status_code, msg)
+            return error_response("Could not refresh the session.", 502)
+
+        if 'id_token' not in body:
+            current_app.logger.error("Refresh response had no id_token.")
+            return error_response("Could not refresh the session.", 502)
+
+        return success_response({
+            "token": body['id_token'],
+            "refresh_token": body.get('refresh_token', refresh_token),
+        })
+    except requests.exceptions.RequestException:
+        current_app.logger.exception("Network error during token refresh.")
+        return error_response("Could not refresh the session.", 503)
+    except Exception:
+        current_app.logger.exception("Unexpected error during token refresh.")
+        return error_response("Could not refresh the session.", 500)
