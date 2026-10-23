@@ -1,4 +1,5 @@
 import math
+import re
 from flask import Blueprint, request, g
 from datetime import datetime, timezone
 import hashlib
@@ -11,11 +12,15 @@ except ImportError:  # pragma: no cover - optional dependency in some environmen
 
 from firebase_config import get_db_ref
 from utils.helpers import (
-    check_pin, error_response, success_response, validate_pin
+    check_pin, error_response, success_response, validate_pin,
+    lookup_allowed, email_index_key, phone_index_key,
+    normalize_email, normalize_phone, write_lookup_indexes,
 )
 from utils.auth_middleware import require_auth
 
 wallet_bp = Blueprint('wallet', __name__)
+
+_TAG_RE = re.compile(r'^kr-\d{10}$')
 
 
 def send_push_notification(user_id, title, body, data=None):
@@ -61,65 +66,81 @@ def get_balance():
         return error_response(f"Failed to fetch balance: {str(e)}", 500)
 
 
+def _public_profile(user_data):
+    return {"kr_tag": user_data.get('kr_tag'), "name": user_data.get('name')}
+
+
 @wallet_bp.route('/api/user/lookup', methods=['POST'])
 @require_auth
 def lookup_user():
     """Look up a user by kr_tag, email, or phone."""
     try:
-        data = request.get_json()
-
-        if not data:
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
             return error_response("Request body is required.")
 
-        query = data.get('query', '').strip()
-
-        if not query:
+        query = data.get('query')
+        query = query.strip() if isinstance(query, str) else ''
+        if not query or len(query) > 100:
             return error_response("Provide a kr_tag, email, or phone number to look up.")
 
+        if not lookup_allowed(g.user_id):
+            return error_response("Too many lookups. Please wait a minute.", 429,
+                                  code="lookup_rate_limited")
+
         db_ref = get_db_ref()
+        uid = None
+        kind = None
 
-        # 1. Try kr_tag lookup first (fastest - direct lookup)
-        kr_tag_ref = db_ref.child("kr_tags").child(query)
-        uid = kr_tag_ref.get()
+        # 1. Direct reads from the right index, based on what was typed.
+        if _TAG_RE.match(query):
+            kind = "tag"
+            uid = db_ref.child("kr_tags").child(query).get()
+        elif '@' in query:
+            kind = "email"
+            if normalize_email(query):
+                uid = db_ref.child("emails").child(email_index_key(query)).get()
+        else:
+            digits = normalize_phone(query)
+            if 10 <= len(digits) <= 15:
+                kind = "phone"
+                uid = db_ref.child("phones").child(phone_index_key(query)).get()
 
-        if uid:
-            user_data = db_ref.child("users").child(uid).get()
-            if user_data:
-                return success_response({
-                    "kr_tag": user_data.get('kr_tag'),
-                    "name": user_data.get('name')
-                })
+        if kind is None:
+            return error_response("Enter a Kerion tag (kr-...), an email, or a phone number.")
 
-        # 2. Try email lookup
-        users_ref = db_ref.child("users")
-        # Firebase Realtime DB doesn't support complex queries natively
-        # We need to fetch users and search (MVP approach)
-        all_users = users_ref.get()
-
-        if all_users:
-            for uid, user_data in all_users.items():
-                # Skip current user
-                if uid == g.user_id:
+        # 2. Fallback for users created before the indexes existed. It scans
+        #    once and repairs the index, so each old user costs one scan.
+        if not uid and kind in ("email", "phone"):
+            users = db_ref.child("users").get() or {}
+            for u, profile in users.items():
+                if not isinstance(profile, dict):
                     continue
+                if kind == "email" and normalize_email(profile.get('email')) == normalize_email(query):
+                    uid = u
+                elif kind == "phone" and normalize_phone(profile.get('phone')) == normalize_phone(query):
+                    uid = u
+                if uid:
+                    try:
+                        write_lookup_indexes(u, profile.get('email'), profile.get('phone'))
+                    except Exception as e:
+                        print(f"Index repair failed for {u}: {e}")
+                    break
 
-                # Check email
-                if user_data.get('email', '').lower() == query.lower():
-                    return success_response({
-                        "kr_tag": user_data.get('kr_tag'),
-                        "name": user_data.get('name')
-                    })
+        if not uid or uid == g.user_id:
+            return error_response(
+                "User not found. Check the kr_tag, email, or phone and try again.", 404)
 
-                # Check phone
-                if user_data.get('phone', '') == query:
-                    return success_response({
-                        "kr_tag": user_data.get('kr_tag'),
-                        "name": user_data.get('name')
-                    })
+        user_data = db_ref.child("users").child(uid).get()
+        if not isinstance(user_data, dict):
+            return error_response(
+                "User not found. Check the kr_tag, email, or phone and try again.", 404)
 
-        return error_response("User not found. Check the kr_tag, email, or phone and try again.", 404)
+        return success_response(_public_profile(user_data))
 
     except Exception as e:
-        return error_response(f"Lookup failed: {str(e)}", 500)
+        print(f"Lookup failed: {e}")
+        return error_response("Lookup failed. Please try again.", 500)
 
 
 @wallet_bp.route('/api/wallet/send', methods=['POST'])
