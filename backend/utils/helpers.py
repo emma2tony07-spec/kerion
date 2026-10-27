@@ -189,3 +189,31 @@ def check_pin(uid, pin, pin_hash):
             429, code="pin_locked")
     return error_response(
         f"Incorrect PIN. {outcome['left']} attempt(s) left.", 401, code="pin_incorrect")
+
+# ─── Generic rate limiter ─────────────────────────────────────────
+
+def rate_limit(scope, raw_key, max_count, window_seconds):
+    """Fixed-window limiter. Returns True if allowed; fails closed on errors."""
+    ref = get_db_ref(f"rate_limits/{scope}/{_index_key(str(raw_key))}")
+    outcome = {}
+
+    def tx(current):
+        outcome.clear()
+        cur = current if isinstance(current, dict) else {}
+        now = time.time()
+        start = float(cur.get("window_start") or 0)
+        count = int(cur.get("count") or 0)
+        if now - start >= window_seconds:
+            start, count = now, 0
+        if count >= max_count:
+            outcome["ok"] = False
+            return {"window_start": start, "count": count}
+        outcome["ok"] = True
+        return {"window_start": start, "count": count + 1}
+
+    try:
+        ref.transaction(tx)
+    except Exception as e:
+        print(f"Rate limiter failed ({scope}): {e}")
+        return False
+    return outcome.get("ok", False)
