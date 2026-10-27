@@ -4,7 +4,8 @@ import os
 from firebase_config import get_db_ref
 from utils.helpers import (
     hash_pin, generate_kr_tag, error_response,
-    success_response, validate_pin, validate_email, validate_phone, write_lookup_indexes
+    success_response, validate_pin, validate_email, validate_phone,
+    write_lookup_indexes, rate_limit
 )
 from datetime import datetime, timezone
 
@@ -308,3 +309,49 @@ def refresh():
     except Exception:
         current_app.logger.exception("Unexpected error during token refresh.")
         return error_response("Could not refresh the session.", 500)
+
+@auth_bp.route('/api/auth/forgot-password', methods=['POST'])
+def forgot_password():
+    """Email a password-reset link. The answer never reveals whether the
+    account exists."""
+    try:
+        data = request.get_json(silent=True)
+        data = data if isinstance(data, dict) else {}
+        email = _text(data, 'email').lower()
+        if len(email) > 254 or not validate_email(email):
+            return error_response("Enter a valid email address.", 400)
+
+        if not FIREBASE_API_KEY:
+            current_app.logger.error("FIREBASE_API_KEY is not configured.")
+            return error_response("Server configuration error. Please contact support.", 500)
+
+        # Behind Render's proxy the client IP is in X-Forwarded-For. The
+        # per-email limit is the dependable one; the IP limit is best-effort.
+        ip = (request.headers.get('X-Forwarded-For', '').split(',')[0].strip()
+              or request.remote_addr or 'unknown')
+        if not rate_limit('reset_ip', ip, 10, 3600) or \
+                not rate_limit('reset_email', email, 3, 3600):
+            return error_response(
+                "Too many reset requests. Please try again later.", 429,
+                code="reset_rate_limited")
+
+        try:
+            resp = requests.post(
+                f"{FIREBASE_AUTH_URL}:sendOobCode",
+                params={"key": FIREBASE_API_KEY},
+                json={"requestType": "PASSWORD_RESET", "email": email},
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                # Includes EMAIL_NOT_FOUND. Log it, but don't tell the client.
+                current_app.logger.info(
+                    "Password reset not sent: HTTP %s", resp.status_code)
+        except requests.exceptions.RequestException:
+            current_app.logger.exception("Network error sending reset email.")
+
+        return success_response({
+            "message": "If an account exists for that email, a reset link has been sent."
+        })
+    except Exception:
+        current_app.logger.exception("Unexpected error in forgot-password.")
+        return error_response("Something went wrong. Please try again.", 500)
