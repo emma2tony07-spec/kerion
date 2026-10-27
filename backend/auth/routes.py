@@ -8,6 +8,7 @@ from utils.helpers import (
     write_lookup_indexes, rate_limit
 )
 from datetime import datetime, timezone
+from flask import Blueprint, request, current_app, Response
 
 auth_bp = Blueprint('auth', __name__)
 
@@ -31,6 +32,9 @@ def _text(data, key):
     value = data.get(key, '')
     return value.strip() if isinstance(value, str) else ''
 
+def _client_ip():
+    return (request.headers.get('X-Forwarded-For', '').split(',')[0].strip()
+            or request.remote_addr or 'unknown')
 
 def _profile(uid, user_data):
     """Client-safe profile returned by login and signup."""
@@ -354,4 +358,171 @@ def forgot_password():
         })
     except Exception:
         current_app.logger.exception("Unexpected error in forgot-password.")
+        return error_response("Something went wrong. Please try again.", 500)
+
+RESET_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Reset your Kerion password</title>
+<style>
+  *{box-sizing:border-box}
+  body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+       background:#0A0F14;color:#EDF2F7;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;padding:20px}
+  .card{width:100%;max-width:400px;background:#111820;border:1px solid #1d2630;border-radius:20px;padding:28px}
+  .logo{width:48px;height:48px;border-radius:14px;background:#00C49F;color:#0A0F14;font-weight:800;
+        font-size:24px;display:flex;align-items:center;justify-content:center;margin:0 auto 14px}
+  h1{font-size:20px;margin:0 0 6px;text-align:center}
+  p.sub{color:#8B9BB5;font-size:13px;line-height:1.5;text-align:center;margin:0 0 20px}
+  label{display:block;font-size:12px;color:#8B9BB5;margin:14px 0 6px}
+  input{width:100%;padding:13px 14px;border-radius:10px;border:1px solid #243040;background:#0A0F14;
+        color:#EDF2F7;font-size:15px;outline:none}
+  input:focus{border-color:#00C49F}
+  button{width:100%;margin-top:20px;padding:14px;border:0;border-radius:10px;background:#00C49F;
+         color:#0A0F14;font-weight:700;font-size:15px;cursor:pointer}
+  button:disabled{opacity:.5;cursor:default}
+  .msg{margin-top:14px;font-size:13px;line-height:1.5;text-align:center;min-height:18px}
+  .err{color:#FF4D6A}.ok{color:#00C49F}
+  .hide{display:none}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">K</div>
+  <h1 id="title">Choose a new password</h1>
+  <p class="sub" id="sub">Enter a new password for your Kerion account.</p>
+  <form id="form" autocomplete="off">
+    <label for="pw">New password</label>
+    <input id="pw" type="password" minlength="6" maxlength="128" required autocomplete="new-password">
+    <label for="pw2">Confirm password</label>
+    <input id="pw2" type="password" minlength="6" maxlength="128" required autocomplete="new-password">
+    <button id="btn" type="submit">Update password</button>
+  </form>
+  <div class="msg" id="msg"></div>
+</div>
+<script>
+(function () {
+  var params = new URLSearchParams(location.search);
+  var code = params.get('oobCode');
+  var mode = params.get('mode');
+  var form = document.getElementById('form');
+  var msg = document.getElementById('msg');
+  var btn = document.getElementById('btn');
+
+  // Keep the one-time code out of the address bar and history.
+  history.replaceState(null, '', location.pathname);
+
+  function show(text, ok) { msg.textContent = text; msg.className = 'msg ' + (ok ? 'ok' : 'err'); }
+
+  if (!code || (mode && mode !== 'resetPassword')) {
+    form.className = 'hide';
+    document.getElementById('title').textContent = 'Link not valid';
+    document.getElementById('sub').textContent =
+      'This reset link is incomplete. Request a new one from the Kerion app.';
+    return;
+  }
+
+  form.addEventListener('submit', function (e) {
+    e.preventDefault();
+    var pw = document.getElementById('pw').value;
+    var pw2 = document.getElementById('pw2').value;
+    if (pw.length < 6) { show('Password must be at least 6 characters.', false); return; }
+    if (pw !== pw2) { show('The passwords do not match.', false); return; }
+    btn.disabled = true; show('Updating...', true);
+    fetch('/api/auth/reset-password', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({oob_code: code, new_password: pw})
+    }).then(function (r) { return r.json().catch(function () { return {}; }); })
+      .then(function (d) {
+        if (d.success) {
+          form.className = 'hide';
+          document.getElementById('title').textContent = 'Password updated';
+          document.getElementById('sub').textContent =
+            'Return to the Kerion app and log in with your new password.';
+          msg.textContent = '';
+        } else {
+          btn.disabled = false;
+          show(d.error || 'Something went wrong. Please try again.', false);
+        }
+      })
+      .catch(function () {
+        btn.disabled = false;
+        show('Could not reach the server. Check your connection and try again.', false);
+      });
+  });
+})();
+</script>
+</body>
+</html>"""
+
+
+@auth_bp.route('/reset-password', methods=['GET'])
+def reset_password_page():
+    """Page the password-reset email links to."""
+    resp = Response(RESET_PAGE, mimetype='text/html')
+    resp.headers['Cache-Control'] = 'no-store'
+    resp.headers['Referrer-Policy'] = 'no-referrer'
+    resp.headers['X-Frame-Options'] = 'DENY'
+    resp.headers['Content-Security-Policy'] = (
+        "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+        "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+    return resp
+
+
+@auth_bp.route('/api/auth/reset-password', methods=['POST'])
+def reset_password():
+    """Complete a password reset using the one-time code from the email."""
+    try:
+        data = request.get_json(silent=True)
+        data = data if isinstance(data, dict) else {}
+        oob_code = data.get('oob_code')
+        new_password = data.get('new_password')
+
+        if not isinstance(oob_code, str) or not oob_code.strip() or len(oob_code) > 512:
+            return error_response("This reset link is invalid.", 400, code="reset_invalid")
+        if not isinstance(new_password, str) or not 6 <= len(new_password) <= 128:
+            return error_response("Password must be between 6 and 128 characters.", 400)
+
+        if not FIREBASE_API_KEY:
+            current_app.logger.error("FIREBASE_API_KEY is not configured.")
+            return error_response("Server configuration error. Please contact support.", 500)
+
+        if not rate_limit('reset_confirm_ip', _client_ip(), 20, 3600):
+            return error_response("Too many attempts. Please try again later.", 429,
+                                  code="reset_rate_limited")
+
+        resp = requests.post(
+            f"{FIREBASE_AUTH_URL}:resetPassword",
+            params={"key": FIREBASE_API_KEY},
+            json={"oobCode": oob_code.strip(), "newPassword": new_password},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            return success_response({"message": "Password updated."})
+
+        try:
+            error_msg, combined = _extract_firebase_error(resp.json())
+        except ValueError:
+            error_msg, combined = '', ''
+
+        if 'EXPIRED_OOB_CODE' in combined:
+            return error_response("This link has expired. Request a new reset email.",
+                                  400, code="reset_expired")
+        if 'INVALID_OOB_CODE' in combined:
+            return error_response("This link is invalid or has already been used.",
+                                  400, code="reset_invalid")
+        if 'WEAK_PASSWORD' in combined:
+            return error_response("Password is too weak. Use at least 6 characters.", 400)
+
+        current_app.logger.warning("Unhandled password reset error: %s", error_msg)
+        return error_response("Could not reset the password. Please request a new link.", 400)
+
+    except requests.exceptions.RequestException:
+        current_app.logger.exception("Network error during password reset.")
+        return error_response("Could not reach the authentication service. Try again.", 503)
+    except Exception:
+        current_app.logger.exception("Unexpected error during password reset.")
         return error_response("Something went wrong. Please try again.", 500)
